@@ -1,6 +1,7 @@
 const http = require('http');
-const { WebSocketServer } = require('ws');
+const { WebSocketServer, WebSocket } = require('ws');
 const { verifyToken } = require('./auth');
+const connections = require('./connections');
 
 function createServer() {
   const server = http.createServer((req, res) => {
@@ -12,9 +13,10 @@ function createServer() {
     res.end(JSON.stringify({ error: 'Not found' }));
   });
 
-  const wss = new WebSocketServer({ noServer: true });
+  // NEW: maxPayload rejects messages over 64 KB
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
 
-  // JWT Check
+  // The JWT is checked here, once, during the handshake
   server.on('upgrade', (req, socket, head) => {
     let user;
     try {
@@ -35,11 +37,43 @@ function createServer() {
   });
 
   wss.on('connection', (socket) => {
-    console.log(`Client connected (user ${socket.user.id})`);
-    socket.send(`Welcome, user ${socket.user.id}!`);
+    const userId = socket.user.id;
+    connections.add(userId, socket);
+    console.log(`Client connected (user ${userId}, ${connections.getSockets(userId).size} open)`);
+    socket.send(`Welcome, user ${userId}!`);
 
-    socket.on('close', () => console.log(`Client disconnected (user ${socket.user.id})`));
+    // NEW: heartbeat bookkeeping and error handler
+    socket.isAlive = true;
+    socket.on('pong', () => { socket.isAlive = true; });
+    socket.on('error', (err) => console.error(`Socket error (user ${userId}):`, err.message));
+
+    // Relay to all of this user's connections (including the sender)
+    socket.on('message', (data, isBinary) => {
+      for (const client of connections.getSockets(userId)) {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(data, { binary: isBinary });
+        }
+      }
+    });
+
+    socket.on('close', () => {
+      connections.remove(userId, socket);
+      console.log(`Client disconnected (user ${userId})`);
+    });
   });
+
+  // NEW: every 30 s, drop sockets that didn't answer the last ping
+  const heartbeat = setInterval(() => {
+    for (const client of wss.clients) {
+      if (!client.isAlive) {
+        client.terminate();
+        continue;
+      }
+      client.isAlive = false;
+      client.ping();
+    }
+  }, 30000);
+  server.on('close', () => clearInterval(heartbeat));
 
   return server;
 }
